@@ -16,7 +16,6 @@ import liveRoutes    from "./routes/liveRoutes.js";
 import { setupLiveSocket } from "./socket/liveSocket.js";
 import superAdminRoutes from "./routes/superAdminRoutes.js";
 
-
 dotenv.config();
 
 const app = express();
