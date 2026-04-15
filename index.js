@@ -24,7 +24,7 @@ const httpServer = createServer(app);
 
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    origin: "https://streamfront-t8b2.vercel.app",
     credentials: true,
   },
 });
@@ -32,7 +32,7 @@ const io = new Server(httpServer, {
 app.locals.io = io;
 setupLiveSocket(io);
 
-app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:3000", credentials: true }));
+app.use(cors({ origin: "https://streamfront-t8b2.vercel.app", credentials: true }));
 app.use(express.json());
 
 app.use("/api/auth",    authRoutes);
