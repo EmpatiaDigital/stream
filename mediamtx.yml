@@ -1,0 +1,15 @@
+# mediamtx.yml
+hlsSegmentDuration: 2s
+hlsSegmentMaxSize:  50MB
+hlsAllowOrigin:     "*"
+
+paths:
+  "~^live/.+$":          # acepta cualquier ruta live/STREAM_KEY
+    runOnReady: >-
+      curl -s -X POST http://localhost:4000/api/live/webhook/start
+      -H "Content-Type: application/json"
+      -d "{\"streamKey\":\"$MTX_PATH\"}"
+    runOnNotReady: >-
+      curl -s -X POST http://localhost:4000/api/live/webhook/end
+      -H "Content-Type: application/json"
+      -d "{\"streamKey\":\"$MTX_PATH\"}"
