@@ -14,6 +14,7 @@ export const setupLiveSocket = (io) => {
   // liveId → Set<socketId>  (participantes actualmente en el escenario)
   const stageRegistry = new Map();
 
+  
   // ── Helper: broadcast lista de viewers con socketId incluido ────────
   const broadcastViewerList = (liveId) => {
     const reg = viewerRegistry.get(liveId);
