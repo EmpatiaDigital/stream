@@ -11,20 +11,22 @@ export const setupLiveSocket = (io) => {
   // liveId → boolean
   const shareEnabled = new Map();
 
-  // liveId → Set<socketId>  (participantes actualmente en el escenario)
+  // liveId → Map<socketId, name>
   const stageRegistry = new Map();
 
-  // liveId → Set<socketId>  (admins designados por el owner)
+  // liveId → Set<socketId>
   const stageAdmins = new Map();
 
-  // liveId → Map<socketId, { micLocked: bool, camLocked: bool }>
-  // Registra si el owner/admin bloqueó los controles de un participante
+  // liveId → Map<socketId, { micLocked, camLocked, micMuted, camOff }>
   const stageLocks = new Map();
 
   // ── Helpers ────────────────────────────────────────────────────────────────
   const isAuthorized = (liveId, socketId) =>
     streamers.get(liveId) === socketId ||
     stageAdmins.get(liveId)?.has(socketId);
+
+  const getSocketName = (socket) =>
+    socket.data?.username ?? "Usuario";
 
   const broadcastViewerList = (liveId) => {
     const reg = viewerRegistry.get(liveId);
@@ -41,16 +43,20 @@ export const setupLiveSocket = (io) => {
     const reg   = stageRegistry.get(liveId);
     const locks = stageLocks.get(liveId) ?? new Map();
     if (!reg) return;
-    const participants = [...reg.entries()].map(([socketId, name]) => ({
-      socketId,
-      name,
-      micLocked: locks.get(socketId)?.micLocked ?? false,
-      camLocked: locks.get(socketId)?.camLocked ?? false,
-    }));
+    const participants = [...reg.entries()].map(([socketId, name]) => {
+      const lock = locks.get(socketId) ?? {};
+      return {
+        socketId,
+        name,
+        micMuted:  lock.micMuted  ?? false,
+        camOff:    lock.camOff    ?? false,
+        micLocked: lock.micLocked ?? false,
+        camLocked: lock.camLocked ?? false,
+      };
+    });
     io.to(`live_${liveId}`).emit("live:stageUpdate", { participants });
   };
 
-  // ── Broadcast lista de admins al owner ─────────────────────────────────────
   const broadcastAdmins = (liveId) => {
     const ownerSocketId = streamers.get(liveId);
     if (!ownerSocketId) return;
@@ -61,6 +67,7 @@ export const setupLiveSocket = (io) => {
   io.on("connection", (socket) => {
     console.log("🔌 Socket conectado:", socket.id);
 
+    // ── Auth JWT ───────────────────────────────────────────────────────────
     try {
       const token = socket.handshake.auth?.token;
       if (token) {
@@ -70,14 +77,14 @@ export const setupLiveSocket = (io) => {
       }
     } catch {}
 
-    // ── JOIN ──────────────────────────────────────────────────────────────────
+    // ── JOIN ──────────────────────────────────────────────────────────────
     socket.on("live:join", ({ liveId }) => {
       if (!liveId) return;
       socket.join(`live_${liveId}`);
 
       if (!viewerRegistry.has(liveId)) viewerRegistry.set(liveId, new Map());
       viewerRegistry.get(liveId).set(socket.id, {
-        name:     socket.data.username ?? "Espectador",
+        name:     getSocketName(socket),
         joinedAt: new Date().toISOString(),
         socketId: socket.id,
       });
@@ -91,25 +98,26 @@ export const setupLiveSocket = (io) => {
 
       if (stageRegistry.has(liveId)) {
         const locks = stageLocks.get(liveId) ?? new Map();
-        const participants = [...stageRegistry.get(liveId).entries()].map(
-          ([sid, name]) => ({
+        const participants = [...stageRegistry.get(liveId).entries()].map(([sid, name]) => {
+          const lock = locks.get(sid) ?? {};
+          return {
             socketId:  sid,
             name,
-            micLocked: locks.get(sid)?.micLocked ?? false,
-            camLocked: locks.get(sid)?.camLocked ?? false,
-          })
-        );
+            micMuted:  lock.micMuted  ?? false,
+            camOff:    lock.camOff    ?? false,
+            micLocked: lock.micLocked ?? false,
+            camLocked: lock.camLocked ?? false,
+          };
+        });
         socket.emit("live:stageUpdate", { participants });
       }
 
-      // Si el socket que se une es un admin designado, informarle
-      const liveAdmins = stageAdmins.get(liveId);
-      if (liveAdmins?.has(socket.id)) {
+      if (stageAdmins.get(liveId)?.has(socket.id)) {
         socket.emit("live:youAreAdmin", { liveId });
       }
     });
 
-    // ── REGISTER STREAMER ─────────────────────────────────────────────────────
+    // ── REGISTER STREAMER ──────────────────────────────────────────────────
     socket.on("live:registerStreamer", ({ liveId, username }) => {
       if (!liveId) return;
       streamers.set(liveId, socket.id);
@@ -129,43 +137,38 @@ export const setupLiveSocket = (io) => {
       }
     });
 
-    // ── DESIGNAR / QUITAR ADMIN ───────────────────────────────────────────────
+    // ── DESIGNAR / QUITAR ADMIN ────────────────────────────────────────────
     socket.on("live:setAdmin", ({ liveId, targetSocketId, isAdmin }) => {
       if (!liveId || !targetSocketId) return;
-      if (streamers.get(liveId) !== socket.id) return; // solo el owner
+      if (streamers.get(liveId) !== socket.id) return;
 
       if (!stageAdmins.has(liveId)) stageAdmins.set(liveId, new Set());
       const admins = stageAdmins.get(liveId);
 
       if (isAdmin) {
         admins.add(targetSocketId);
-        // Notificar al nuevo admin
         io.to(targetSocketId).emit("live:youAreAdmin", { liveId });
-        console.log(`👮 Admin designado: liveId=${liveId} socketId=${targetSocketId}`);
       } else {
         admins.delete(targetSocketId);
         io.to(targetSocketId).emit("live:adminRevoked", { liveId });
-        console.log(`👮 Admin revocado: liveId=${liveId} socketId=${targetSocketId}`);
       }
-
       broadcastAdmins(liveId);
     });
 
-    // ── SHARE STATE ───────────────────────────────────────────────────────────
+    // ── SHARE STATE ────────────────────────────────────────────────────────
     socket.on("live:setShare", ({ liveId, enabled }) => {
-      if (!liveId) return;
-      if (streamers.get(liveId) !== socket.id) return;
+      if (!liveId || streamers.get(liveId) !== socket.id) return;
       shareEnabled.set(liveId, !!enabled);
       io.to(`live_${liveId}`).emit("live:shareState", { enabled: !!enabled });
     });
 
-    // ── CAM STATE ─────────────────────────────────────────────────────────────
+    // ── CAM STATE ──────────────────────────────────────────────────────────
     socket.on("live:camState", ({ liveId, on }) => {
       if (!liveId) return;
       socket.to(`live_${liveId}`).emit("live:camState", { on: !!on });
     });
 
-    // ── VIEWER READY ──────────────────────────────────────────────────────────
+    // ── VIEWER READY ───────────────────────────────────────────────────────
     socket.on("webrtc:viewerReady", ({ liveId }) => {
       if (!liveId) return;
       socket.join(`live_${liveId}`);
@@ -178,10 +181,10 @@ export const setupLiveSocket = (io) => {
       }
     });
 
-    // ── CHAT ──────────────────────────────────────────────────────────────────
+    // ── CHAT ───────────────────────────────────────────────────────────────
     socket.on("live:chat", ({ liveId, message, username: clientUsername }) => {
       if (!liveId || !message?.trim()) return;
-      const username = socket.data?.username ?? clientUsername ?? "Usuario";
+      const username = getSocketName(socket) || clientUsername || "Usuario";
       io.to(`live_${liveId}`).emit("live:chat", {
         username,
         message: message.slice(0, 200),
@@ -189,23 +192,19 @@ export const setupLiveSocket = (io) => {
       });
     });
 
-    // ── GIFT ──────────────────────────────────────────────────────────────────
+    // ── GIFT ───────────────────────────────────────────────────────────────
     socket.on("live:gift", ({ liveId, type, amount }) => {
       if (!liveId) return;
-      const from = socket.data?.username ?? "Usuario";
       io.to(`live_${liveId}`).emit("live:gift", {
-        from,
+        from:   getSocketName(socket),
         type:   type ?? "corazon",
         amount: Math.min(Number(amount) || 1, 999),
       });
     });
 
-    // ── WebRTC principal: offer / answer / ice ────────────────────────────────
+    // ── WebRTC principal ───────────────────────────────────────────────────
     socket.on("webrtc:offer", ({ targetSocketId, sdp }) => {
       if (!targetSocketId || !sdp) return;
-      if (!iceCandidateQueues.has(targetSocketId))
-        iceCandidateQueues.set(targetSocketId, new Map());
-      iceCandidateQueues.get(targetSocketId).set(socket.id, []);
       io.to(targetSocketId).emit("webrtc:offer", { streamerSocketId: socket.id, sdp });
     });
 
@@ -219,20 +218,27 @@ export const setupLiveSocket = (io) => {
       io.to(targetSocketId).emit("webrtc:ice", { fromSocketId: socket.id, candidate });
     });
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // ESCENARIO (stage)
-    // ─────────────────────────────────────────────────────────────────────────
+    // ═════════════════════════════════════════════════════════════════════
+    // ESCENARIO
+    // ═════════════════════════════════════════════════════════════════════
 
     socket.on("stage:invite", ({ liveId, targetSocketId }) => {
       if (!liveId || !targetSocketId) return;
       if (!isAuthorized(liveId, socket.id)) return;
-      console.log(`🎙 stage:invite  owner/admin=${socket.id} → viewer=${targetSocketId}`);
-      io.to(targetSocketId).emit("stage:invited", { ownerSocketId: socket.id, liveId });
+      const ownerSocketId = streamers.get(liveId);
+      console.log(`🎙 stage:invite owner/admin=${socket.id} → viewer=${targetSocketId}`);
+      // Siempre le enviamos el socketId del OWNER (streamer), no del admin
+      io.to(targetSocketId).emit("stage:invited", {
+        ownerSocketId: ownerSocketId ?? socket.id,
+        liveId,
+      });
     });
 
     socket.on("stage:offer", ({ targetSocketId, fromName, sdp }) => {
       if (!targetSocketId || !sdp) return;
-      const name = fromName ?? socket.data?.username ?? "Invitado";
+      // El nombre real viene del JWT, fromName es fallback
+      const name = getSocketName(socket) || fromName || "Invitado";
+      console.log(`🎙 stage:offer viewer=${socket.id}(${name}) → owner=${targetSocketId}`);
       io.to(targetSocketId).emit("stage:offer", {
         fromSocketId: socket.id,
         fromName:     name,
@@ -242,15 +248,24 @@ export const setupLiveSocket = (io) => {
 
     socket.on("stage:answer", ({ targetSocketId, sdp }) => {
       if (!targetSocketId || !sdp) return;
+      // Registrar al viewer en el escenario
       for (const [liveId, streamerSocketId] of streamers.entries()) {
         if (streamerSocketId === socket.id) {
           if (!stageRegistry.has(liveId)) stageRegistry.set(liveId, new Map());
           if (!stageLocks.has(liveId))    stageLocks.set(liveId, new Map());
-          const name = io.sockets.sockets.get(targetSocketId)?.data?.username ?? "Invitado";
+
+          // Nombre real del invitado
+          const invitedSocket = io.sockets.sockets.get(targetSocketId);
+          const name = invitedSocket
+            ? (getSocketName(invitedSocket) || "Invitado")
+            : (viewerRegistry.get(liveId)?.get(targetSocketId)?.name ?? "Invitado");
+
           stageRegistry.get(liveId).set(targetSocketId, name);
-          // Inicializar locks en false
           if (!stageLocks.get(liveId).has(targetSocketId)) {
-            stageLocks.get(liveId).set(targetSocketId, { micLocked: false, camLocked: false });
+            stageLocks.get(liveId).set(targetSocketId, {
+              micMuted: false, camOff: false,
+              micLocked: false, camLocked: false,
+            });
           }
           broadcastStage(liveId);
           break;
@@ -267,61 +282,67 @@ export const setupLiveSocket = (io) => {
     socket.on("stage:remove", ({ liveId, targetSocketId }) => {
       if (!liveId || !targetSocketId) return;
       if (!isAuthorized(liveId, socket.id)) return;
-
       stageRegistry.get(liveId)?.delete(targetSocketId);
       stageLocks.get(liveId)?.delete(targetSocketId);
       broadcastStage(liveId);
       io.to(targetSocketId).emit("stage:removed");
     });
 
-    // ── ADMIN MIC/CAM MUTE — con bloqueo de control ───────────────────────────
+    // ── ADMIN MIC/CAM con lock ─────────────────────────────────────────────
     /**
-     * Emitido por owner/admin para silenciar mic de un participante.
-     * Payload: { liveId, targetSocketId, mute: bool, lock: bool }
-     *   - mute: true = apagar mic
-     *   - lock: true = además bloquear el botón en el invitado
-     *           false = solo silenciar, el invitado puede reactivar
+     * stage:adminMuteMic
+     * { liveId, targetSocketId, mute: bool, lock: bool }
+     *
+     * El servidor guarda el estado y lo reenvía al viewer.
+     * El viewer apaga su propio track (track.enabled = false).
+     * Si lock=true el viewer no puede reactivarlo desde su UI.
      */
     socket.on("stage:adminMuteMic", ({ liveId, targetSocketId, mute, lock }) => {
       if (!liveId || !targetSocketId) return;
       if (!isAuthorized(liveId, socket.id)) return;
 
-      // Actualizar lock en el servidor
       if (!stageLocks.has(liveId)) stageLocks.set(liveId, new Map());
       const locks = stageLocks.get(liveId);
-      const cur   = locks.get(targetSocketId) ?? { micLocked: false, camLocked: false };
-      locks.set(targetSocketId, { ...cur, micLocked: !!lock });
+      const cur   = locks.get(targetSocketId) ?? {};
+      locks.set(targetSocketId, { ...cur, micMuted: !!mute, micLocked: !!lock });
 
-      // Notificar al invitado
+      // Notificar al VIEWER para que apague su track
       io.to(targetSocketId).emit("stage:adminMuteMic", { mute: !!mute, lock: !!lock });
 
-      // Actualizar stageUpdate para todos (para reflejar locks)
       broadcastStage(liveId);
-
-      console.log(`🎙 adminMuteMic → ${targetSocketId} mute=${mute} lock=${lock}`);
     });
 
-    /**
-     * Emitido por owner/admin para apagar cam de un participante.
-     * Payload: { liveId, targetSocketId, off: bool, lock: bool }
-     */
     socket.on("stage:adminMuteCam", ({ liveId, targetSocketId, off, lock }) => {
       if (!liveId || !targetSocketId) return;
       if (!isAuthorized(liveId, socket.id)) return;
 
       if (!stageLocks.has(liveId)) stageLocks.set(liveId, new Map());
       const locks = stageLocks.get(liveId);
-      const cur   = locks.get(targetSocketId) ?? { micLocked: false, camLocked: false };
-      locks.set(targetSocketId, { ...cur, camLocked: !!lock });
+      const cur   = locks.get(targetSocketId) ?? {};
+      locks.set(targetSocketId, { ...cur, camOff: !!off, camLocked: !!lock });
 
       io.to(targetSocketId).emit("stage:adminMuteCam", { off: !!off, lock: !!lock });
 
       broadcastStage(liveId);
-
-      console.log(`🎙 adminMuteCam → ${targetSocketId} off=${off} lock=${lock}`);
     });
 
-    // ── LIVE: OWNER END ───────────────────────────────────────────────────────
+    /**
+     * El viewer reporta su estado actual de mic/cam al servidor
+     * para que el stageUpdate refleje la realidad.
+     * { liveId, micOn, camOn }
+     */
+    socket.on("stage:selfState", ({ liveId, micOn, camOn }) => {
+      if (!liveId) return;
+      if (!stageLocks.has(liveId)) return;
+      const locks = stageLocks.get(liveId);
+      const cur   = locks.get(socket.id) ?? {};
+      // Solo actualizar muted/off, no los locks (esos los controla el owner)
+      if (!cur.micLocked) locks.set(socket.id, { ...cur, micMuted: !micOn });
+      if (!cur.camLocked) locks.set(socket.id, { ...cur, camOff:  !camOn });
+      broadcastStage(liveId);
+    });
+
+    // ── LIVE: OWNER END ────────────────────────────────────────────────────
     socket.on("live:ownerEnd", ({ liveId }) => {
       if (!liveId) return;
       io.to(`live_${liveId}`).emit("live:ended", { liveId });
@@ -334,7 +355,7 @@ export const setupLiveSocket = (io) => {
       stageAdmins.delete(liveId);
     });
 
-    // ── LIVE: LEAVE ───────────────────────────────────────────────────────────
+    // ── LIVE: LEAVE ────────────────────────────────────────────────────────
     socket.on("live:leave", ({ liveId }) => {
       if (!liveId) return;
       pendingViewers.get(liveId)?.delete(socket.id);
@@ -355,7 +376,7 @@ export const setupLiveSocket = (io) => {
       broadcastViewerList(liveId);
     });
 
-    // ── DISCONNECT ────────────────────────────────────────────────────────────
+    // ── DISCONNECT ─────────────────────────────────────────────────────────
     socket.on("disconnect", () => {
       console.log("🔌 Socket desconectado:", socket.id);
 
@@ -373,9 +394,7 @@ export const setupLiveSocket = (io) => {
         }
       }
 
-      for (const viewers of pendingViewers.values()) {
-        viewers.delete(socket.id);
-      }
+      for (const viewers of pendingViewers.values()) viewers.delete(socket.id);
 
       for (const [liveId, reg] of viewerRegistry.entries()) {
         if (reg.has(socket.id)) {
@@ -392,9 +411,7 @@ export const setupLiveSocket = (io) => {
         }
       }
 
-      for (const admins of stageAdmins.values()) {
-        admins.delete(socket.id);
-      }
+      for (const admins of stageAdmins.values()) admins.delete(socket.id);
 
       iceCandidateQueues.delete(socket.id);
     });
