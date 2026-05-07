@@ -20,7 +20,6 @@ export const setupLiveSocket = (io) => {
   // liveId → Map<socketId, { micLocked, camLocked, micMuted, camOff }>
   const stageLocks = new Map();
 
-  // Mapa inverso: viewerSocketId → ownerSocketId (para stage answer routing)
   // liveId → Map<viewerSocketId, ownerSocketId>
   const stagePendingAnswers = new Map();
 
@@ -29,10 +28,22 @@ export const setupLiveSocket = (io) => {
     streamers.get(liveId) === socketId ||
     stageAdmins.get(liveId)?.has(socketId);
 
-  const getSocketName = (socket) => {
-    // Prioridad: username del JWT > name del JWT > data guardada
-    return socket.data?.username || socket.data?.name || "Usuario";
-  };
+  /**
+   * Resuelve el nombre real del socket.
+   *
+   * PRIORIDAD (de mayor a menor):
+   *   1. socket.data.username  ← decodificado del JWT en el handshake
+   *   2. socket.data.name      ← alias del campo anterior
+   *   3. "Usuario"             ← fallback (nunca debería llegar acá si el JWT está bien)
+   *
+   * NUNCA usamos el nombre que manda el cliente en el payload del evento;
+   * eso era la causa del bug: si el cliente mandaba "" o "undefined" se
+   * mostraba eso en lugar del nombre real.
+   */
+  const getSocketName = (socket) =>
+    socket.data?.username?.trim() ||
+    socket.data?.name?.trim()     ||
+    "Usuario";
 
   const broadcastViewerList = (liveId) => {
     const reg = viewerRegistry.get(liveId);
@@ -74,25 +85,42 @@ export const setupLiveSocket = (io) => {
     console.log("🔌 Socket conectado:", socket.id);
 
     // ── Auth JWT ───────────────────────────────────────────────────────────
+    // Decodificamos el JWT una sola vez al conectar y guardamos el nombre
+    // en socket.data. A partir de acá SIEMPRE usamos getSocketName(socket).
     try {
       const token = socket.handshake.auth?.token;
       if (token) {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        socket.data.userId   = decoded.id   ?? decoded._id ?? null;
-        // Guardar TODOS los campos posibles de nombre
-        socket.data.username = decoded.name ?? decoded.username ?? decoded.email?.split("@")[0] ?? null;
-        socket.data.name     = socket.data.username;
+        socket.data.userId = decoded.id ?? decoded._id ?? null;
+        // Intentar todos los campos posibles donde puede venir el nombre
+        const resolvedName =
+          decoded.name?.trim()     ||
+          decoded.username?.trim() ||
+          decoded.email?.split("@")[0]?.trim() ||
+          null;
+        socket.data.username = resolvedName;
+        socket.data.name     = resolvedName;
       }
     } catch {}
 
     // ── JOIN ──────────────────────────────────────────────────────────────
-    socket.on("live:join", ({ liveId }) => {
+    // El cliente puede mandar `username` como respaldo, pero solo se usa
+    // si el JWT no tenía nombre (caso muy improbable).
+    socket.on("live:join", ({ liveId, username: clientUsername }) => {
       if (!liveId) return;
       socket.join(`live_${liveId}`);
 
+      // Si el JWT no resolvió un nombre, usar el que mandó el cliente
+      if (!socket.data.username && clientUsername?.trim()) {
+        socket.data.username = clientUsername.trim();
+        socket.data.name     = clientUsername.trim();
+      }
+
+      const name = getSocketName(socket);
+
       if (!viewerRegistry.has(liveId)) viewerRegistry.set(liveId, new Map());
       viewerRegistry.get(liveId).set(socket.id, {
-        name:     getSocketName(socket),
+        name,
         joinedAt: new Date().toISOString(),
         socketId: socket.id,
       });
@@ -106,11 +134,11 @@ export const setupLiveSocket = (io) => {
 
       if (stageRegistry.has(liveId)) {
         const locks = stageLocks.get(liveId) ?? new Map();
-        const participants = [...stageRegistry.get(liveId).entries()].map(([sid, name]) => {
+        const participants = [...stageRegistry.get(liveId).entries()].map(([sid, sName]) => {
           const lock = locks.get(sid) ?? {};
           return {
             socketId:  sid,
-            name,
+            name:      sName,
             micMuted:  lock.micMuted  ?? false,
             camOff:    lock.camOff    ?? false,
             micLocked: lock.micLocked ?? false,
@@ -126,16 +154,19 @@ export const setupLiveSocket = (io) => {
     });
 
     // ── REGISTER STREAMER ──────────────────────────────────────────────────
-    socket.on("live:registerStreamer", ({ liveId, username }) => {
+    socket.on("live:registerStreamer", ({ liveId, username: clientUsername }) => {
       if (!liveId) return;
       streamers.set(liveId, socket.id);
       if (!shareEnabled.has(liveId)) shareEnabled.set(liveId, true);
-      if (username) {
-        socket.data.username = username;
-        socket.data.name = username;
+
+      // Solo actualizar si el JWT no resolvió nombre
+      if (!socket.data.username && clientUsername?.trim()) {
+        socket.data.username = clientUsername.trim();
+        socket.data.name     = clientUsername.trim();
       }
+
       socket.join(`live_${liveId}`);
-      console.log(`🎥 Streamer registrado: liveId=${liveId} socketId=${socket.id} name=${socket.data.username}`);
+      console.log(`🎥 Streamer registrado: liveId=${liveId} socketId=${socket.id} name=${getSocketName(socket)}`);
 
       const pending = pendingViewers.get(liveId);
       if (pending?.size > 0) {
@@ -193,10 +224,11 @@ export const setupLiveSocket = (io) => {
     });
 
     // ── CHAT ───────────────────────────────────────────────────────────────
-    socket.on("live:chat", ({ liveId, message, username: clientUsername }) => {
+    // El username que manda el cliente se IGNORA completamente.
+    // Siempre se usa el nombre del JWT (getSocketName).
+    socket.on("live:chat", ({ liveId, message }) => {
       if (!liveId || !message?.trim()) return;
-      // Usar SIEMPRE el nombre del JWT primero, luego el que manda el cliente
-      const username = getSocketName(socket) || clientUsername || "Usuario";
+      const username = getSocketName(socket);
       io.to(`live_${liveId}`).emit("live:chat", {
         username,
         message: message.slice(0, 200),
@@ -240,7 +272,6 @@ export const setupLiveSocket = (io) => {
       const ownerSocketId = streamers.get(liveId);
       console.log(`🎙 stage:invite owner/admin=${socket.id} → viewer=${targetSocketId}`);
 
-      // Guardar qué ownerSocketId espera el answer de este viewer
       if (!stagePendingAnswers.has(liveId)) stagePendingAnswers.set(liveId, new Map());
       stagePendingAnswers.get(liveId).set(targetSocketId, ownerSocketId ?? socket.id);
 
@@ -250,10 +281,12 @@ export const setupLiveSocket = (io) => {
       });
     });
 
-    // El VIEWER envía su offer al owner
-    socket.on("stage:offer", ({ targetSocketId, fromName, sdp }) => {
+    // El VIEWER envía su offer al owner.
+    // fromName se ignora; el nombre real viene del JWT del viewer.
+    socket.on("stage:offer", ({ targetSocketId, sdp }) => {
       if (!targetSocketId || !sdp) return;
-      const name = getSocketName(socket) || fromName || "Invitado";
+      // Nombre resuelto desde el JWT del viewer (no del payload)
+      const name = getSocketName(socket);
       console.log(`🎙 stage:offer viewer=${socket.id}(${name}) → owner/admin=${targetSocketId}`);
       io.to(targetSocketId).emit("stage:offer", {
         fromSocketId: socket.id,
@@ -263,31 +296,19 @@ export const setupLiveSocket = (io) => {
     });
 
     // El OWNER/ADMIN envía su answer al viewer
-    // IMPORTANTE: el answer va de owner → viewer (targetSocketId = viewerSocketId)
     socket.on("stage:answer", ({ targetSocketId, sdp, liveId: answerLiveId }) => {
       if (!targetSocketId || !sdp) return;
 
-      // Registrar al viewer en el escenario cuando el owner envía el answer
-      // Buscar el liveId del que está enviando el answer (el owner/admin)
       let foundLiveId = answerLiveId;
 
       if (!foundLiveId) {
-        // Buscar por streamers
         for (const [liveId, streamerSocketId] of streamers.entries()) {
-          if (streamerSocketId === socket.id) {
-            foundLiveId = liveId;
-            break;
-          }
+          if (streamerSocketId === socket.id) { foundLiveId = liveId; break; }
         }
       }
-
       if (!foundLiveId) {
-        // Buscar si es un admin
         for (const [liveId, admins] of stageAdmins.entries()) {
-          if (admins.has(socket.id)) {
-            foundLiveId = liveId;
-            break;
-          }
+          if (admins.has(socket.id)) { foundLiveId = liveId; break; }
         }
       }
 
@@ -295,10 +316,10 @@ export const setupLiveSocket = (io) => {
         if (!stageRegistry.has(foundLiveId)) stageRegistry.set(foundLiveId, new Map());
         if (!stageLocks.has(foundLiveId))    stageLocks.set(foundLiveId, new Map());
 
-        // Nombre real del invitado (viewer que está en targetSocketId)
+        // Nombre real del invitado: siempre desde socket.data del viewer
         const invitedSocket = io.sockets.sockets.get(targetSocketId);
         const name = invitedSocket
-          ? (getSocketName(invitedSocket) || "Invitado")
+          ? getSocketName(invitedSocket)
           : (viewerRegistry.get(foundLiveId)?.get(targetSocketId)?.name ?? "Invitado");
 
         stageRegistry.get(foundLiveId).set(targetSocketId, name);
@@ -311,7 +332,6 @@ export const setupLiveSocket = (io) => {
         broadcastStage(foundLiveId);
       }
 
-      // Enviar el answer al VIEWER (targetSocketId = viewerSocketId)
       io.to(targetSocketId).emit("stage:answer", { sdp, fromSocketId: socket.id });
     });
 
@@ -330,13 +350,14 @@ export const setupLiveSocket = (io) => {
       io.to(targetSocketId).emit("stage:removed");
     });
 
-    // ── DESTACAR participante en el escenario ──────────────────────────────
-    socket.on("stage:spotlight", ({ liveId, targetSocketId }) => {
+    // ── SPOTLIGHT ─────────────────────────────────────────────────────────
+    // socketId puede ser null (quitar destaque) o un socketId válido
+    socket.on("stage:spotlight", ({ liveId, socketId }) => {
       if (!liveId) return;
       if (!isAuthorized(liveId, socket.id)) return;
-      // Broadcast a todos en el live
+      // Broadcast a TODOS en el live (incluyendo el que emitió)
       io.to(`live_${liveId}`).emit("stage:spotlight", {
-        socketId: targetSocketId, // null = quitar spotlight
+        socketId: socketId ?? null,
       });
     });
 
@@ -372,7 +393,6 @@ export const setupLiveSocket = (io) => {
       if (!stageLocks.has(liveId)) return;
       const locks = stageLocks.get(liveId);
       const cur   = locks.get(socket.id) ?? {};
-      // Solo actualizar muted/off si no está bloqueado
       const updated = { ...cur };
       if (!cur.micLocked) updated.micMuted = !micOn;
       if (!cur.camLocked) updated.camOff   = !camOn;
