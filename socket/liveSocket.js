@@ -332,6 +332,8 @@ export const setupLiveSocket = (io) => {
         broadcastStage(foundLiveId);
       }
 
+      // fromSocketId = quien envía el answer (owner/admin), necesario para
+      // que el viewer pueda hacer routing correcto en stagePCsRef.
       io.to(targetSocketId).emit("stage:answer", { sdp, fromSocketId: socket.id });
     });
 
