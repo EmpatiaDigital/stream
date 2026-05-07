@@ -151,6 +151,25 @@ export const setupLiveSocket = (io) => {
       if (stageAdmins.get(liveId)?.has(socket.id)) {
         socket.emit("live:youAreAdmin", { liveId });
       }
+
+      // Si ya hay participantes en el escenario, notificar al nuevo viewer
+      // para que pueda iniciar conexión P2P con cada uno de ellos
+      const stageReg = stageRegistry.get(liveId);
+      const ownerSocketId = streamers.get(liveId);
+      if (stageReg && stageReg.size > 0) {
+        for (const [participantSocketId, participantName] of stageReg.entries()) {
+          if (participantSocketId !== ownerSocketId) {
+            socket.emit("stage:newParticipant", {
+              participantSocketId,
+              participantName,
+            });
+            // Decirle al participante del escenario que conecte con este nuevo viewer
+            io.to(participantSocketId).emit("stage:connectToViewer", {
+              viewerSocketId: socket.id,
+            });
+          }
+        }
+      }
     });
 
     // ── REGISTER STREAMER ──────────────────────────────────────────────────
@@ -330,6 +349,32 @@ export const setupLiveSocket = (io) => {
           });
         }
         broadcastStage(foundLiveId);
+
+        // Notificar a todos los viewers comunes (no owner, no el propio invitado)
+        // para que puedan negociar WebRTC directamente con el nuevo participante
+        // del escenario y así ver/escuchar sus tiles.
+        const ownerSocketId = streamers.get(foundLiveId);
+        const reg = viewerRegistry.get(foundLiveId);
+        if (reg) {
+          for (const [viewerSocketId] of reg.entries()) {
+            if (
+              viewerSocketId !== targetSocketId &&        // no el propio invitado
+              viewerSocketId !== ownerSocketId  &&        // no el owner
+              viewerSocketId !== socket.id               // no quien envió el answer
+            ) {
+              // Decirle al viewer que hay un nuevo participante en el escenario
+              // y que debe iniciar negociación WebRTC con él
+              io.to(viewerSocketId).emit("stage:newParticipant", {
+                participantSocketId: targetSocketId,
+                participantName:     name,
+              });
+              // Decirle al participante del escenario que hay un viewer esperando
+              io.to(targetSocketId).emit("stage:connectToViewer", {
+                viewerSocketId,
+              });
+            }
+          }
+        }
       }
 
       // fromSocketId = quien envía el answer (owner/admin), necesario para
@@ -340,6 +385,36 @@ export const setupLiveSocket = (io) => {
     socket.on("stage:ice", ({ targetSocketId, candidate }) => {
       if (!targetSocketId || !candidate) return;
       io.to(targetSocketId).emit("stage:ice", { fromSocketId: socket.id, candidate });
+    });
+
+    // ── Señalización P2P entre participante del escenario y viewers normales ──
+    // El participante del escenario envía offer a cada viewer normal
+    socket.on("stage:viewerOffer", ({ targetSocketId, sdp, fromName }) => {
+      if (!targetSocketId || !sdp) return;
+      const name = getSocketName(socket) || fromName || "Invitado";
+      io.to(targetSocketId).emit("stage:viewerOffer", {
+        fromSocketId: socket.id,
+        fromName:     name,
+        sdp,
+      });
+    });
+
+    // El viewer normal responde al participante del escenario
+    socket.on("stage:viewerAnswer", ({ targetSocketId, sdp }) => {
+      if (!targetSocketId || !sdp) return;
+      io.to(targetSocketId).emit("stage:viewerAnswer", {
+        fromSocketId: socket.id,
+        sdp,
+      });
+    });
+
+    // ICE candidates para conexiones viewer↔stage
+    socket.on("stage:viewerIce", ({ targetSocketId, candidate }) => {
+      if (!targetSocketId || !candidate) return;
+      io.to(targetSocketId).emit("stage:viewerIce", {
+        fromSocketId: socket.id,
+        candidate,
+      });
     });
 
     socket.on("stage:remove", ({ liveId, targetSocketId }) => {
