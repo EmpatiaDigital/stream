@@ -20,13 +20,19 @@ export const setupLiveSocket = (io) => {
   // liveId → Map<socketId, { micLocked, camLocked, micMuted, camOff }>
   const stageLocks = new Map();
 
+  // Mapa inverso: viewerSocketId → ownerSocketId (para stage answer routing)
+  // liveId → Map<viewerSocketId, ownerSocketId>
+  const stagePendingAnswers = new Map();
+
   // ── Helpers ────────────────────────────────────────────────────────────────
   const isAuthorized = (liveId, socketId) =>
     streamers.get(liveId) === socketId ||
     stageAdmins.get(liveId)?.has(socketId);
 
-  const getSocketName = (socket) =>
-    socket.data?.username ?? "Usuario";
+  const getSocketName = (socket) => {
+    // Prioridad: username del JWT > name del JWT > data guardada
+    return socket.data?.username || socket.data?.name || "Usuario";
+  };
 
   const broadcastViewerList = (liveId) => {
     const reg = viewerRegistry.get(liveId);
@@ -72,8 +78,10 @@ export const setupLiveSocket = (io) => {
       const token = socket.handshake.auth?.token;
       if (token) {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        socket.data.userId   = decoded.id;
-        socket.data.username = decoded.name ?? decoded.username ?? null;
+        socket.data.userId   = decoded.id   ?? decoded._id ?? null;
+        // Guardar TODOS los campos posibles de nombre
+        socket.data.username = decoded.name ?? decoded.username ?? decoded.email?.split("@")[0] ?? null;
+        socket.data.name     = socket.data.username;
       }
     } catch {}
 
@@ -122,9 +130,12 @@ export const setupLiveSocket = (io) => {
       if (!liveId) return;
       streamers.set(liveId, socket.id);
       if (!shareEnabled.has(liveId)) shareEnabled.set(liveId, true);
-      if (username) socket.data.username = username;
+      if (username) {
+        socket.data.username = username;
+        socket.data.name = username;
+      }
       socket.join(`live_${liveId}`);
-      console.log(`🎥 Streamer registrado: liveId=${liveId} socketId=${socket.id}`);
+      console.log(`🎥 Streamer registrado: liveId=${liveId} socketId=${socket.id} name=${socket.data.username}`);
 
       const pending = pendingViewers.get(liveId);
       if (pending?.size > 0) {
@@ -184,6 +195,7 @@ export const setupLiveSocket = (io) => {
     // ── CHAT ───────────────────────────────────────────────────────────────
     socket.on("live:chat", ({ liveId, message, username: clientUsername }) => {
       if (!liveId || !message?.trim()) return;
+      // Usar SIEMPRE el nombre del JWT primero, luego el que manda el cliente
       const username = getSocketName(socket) || clientUsername || "Usuario";
       io.to(`live_${liveId}`).emit("live:chat", {
         username,
@@ -227,18 +239,22 @@ export const setupLiveSocket = (io) => {
       if (!isAuthorized(liveId, socket.id)) return;
       const ownerSocketId = streamers.get(liveId);
       console.log(`🎙 stage:invite owner/admin=${socket.id} → viewer=${targetSocketId}`);
-      // Siempre le enviamos el socketId del OWNER (streamer), no del admin
+
+      // Guardar qué ownerSocketId espera el answer de este viewer
+      if (!stagePendingAnswers.has(liveId)) stagePendingAnswers.set(liveId, new Map());
+      stagePendingAnswers.get(liveId).set(targetSocketId, ownerSocketId ?? socket.id);
+
       io.to(targetSocketId).emit("stage:invited", {
         ownerSocketId: ownerSocketId ?? socket.id,
         liveId,
       });
     });
 
+    // El VIEWER envía su offer al owner
     socket.on("stage:offer", ({ targetSocketId, fromName, sdp }) => {
       if (!targetSocketId || !sdp) return;
-      // El nombre real viene del JWT, fromName es fallback
       const name = getSocketName(socket) || fromName || "Invitado";
-      console.log(`🎙 stage:offer viewer=${socket.id}(${name}) → owner=${targetSocketId}`);
+      console.log(`🎙 stage:offer viewer=${socket.id}(${name}) → owner/admin=${targetSocketId}`);
       io.to(targetSocketId).emit("stage:offer", {
         fromSocketId: socket.id,
         fromName:     name,
@@ -246,32 +262,57 @@ export const setupLiveSocket = (io) => {
       });
     });
 
-    socket.on("stage:answer", ({ targetSocketId, sdp }) => {
+    // El OWNER/ADMIN envía su answer al viewer
+    // IMPORTANTE: el answer va de owner → viewer (targetSocketId = viewerSocketId)
+    socket.on("stage:answer", ({ targetSocketId, sdp, liveId: answerLiveId }) => {
       if (!targetSocketId || !sdp) return;
-      // Registrar al viewer en el escenario
-      for (const [liveId, streamerSocketId] of streamers.entries()) {
-        if (streamerSocketId === socket.id) {
-          if (!stageRegistry.has(liveId)) stageRegistry.set(liveId, new Map());
-          if (!stageLocks.has(liveId))    stageLocks.set(liveId, new Map());
 
-          // Nombre real del invitado
-          const invitedSocket = io.sockets.sockets.get(targetSocketId);
-          const name = invitedSocket
-            ? (getSocketName(invitedSocket) || "Invitado")
-            : (viewerRegistry.get(liveId)?.get(targetSocketId)?.name ?? "Invitado");
+      // Registrar al viewer en el escenario cuando el owner envía el answer
+      // Buscar el liveId del que está enviando el answer (el owner/admin)
+      let foundLiveId = answerLiveId;
 
-          stageRegistry.get(liveId).set(targetSocketId, name);
-          if (!stageLocks.get(liveId).has(targetSocketId)) {
-            stageLocks.get(liveId).set(targetSocketId, {
-              micMuted: false, camOff: false,
-              micLocked: false, camLocked: false,
-            });
+      if (!foundLiveId) {
+        // Buscar por streamers
+        for (const [liveId, streamerSocketId] of streamers.entries()) {
+          if (streamerSocketId === socket.id) {
+            foundLiveId = liveId;
+            break;
           }
-          broadcastStage(liveId);
-          break;
         }
       }
-      io.to(targetSocketId).emit("stage:answer", { sdp });
+
+      if (!foundLiveId) {
+        // Buscar si es un admin
+        for (const [liveId, admins] of stageAdmins.entries()) {
+          if (admins.has(socket.id)) {
+            foundLiveId = liveId;
+            break;
+          }
+        }
+      }
+
+      if (foundLiveId) {
+        if (!stageRegistry.has(foundLiveId)) stageRegistry.set(foundLiveId, new Map());
+        if (!stageLocks.has(foundLiveId))    stageLocks.set(foundLiveId, new Map());
+
+        // Nombre real del invitado (viewer que está en targetSocketId)
+        const invitedSocket = io.sockets.sockets.get(targetSocketId);
+        const name = invitedSocket
+          ? (getSocketName(invitedSocket) || "Invitado")
+          : (viewerRegistry.get(foundLiveId)?.get(targetSocketId)?.name ?? "Invitado");
+
+        stageRegistry.get(foundLiveId).set(targetSocketId, name);
+        if (!stageLocks.get(foundLiveId).has(targetSocketId)) {
+          stageLocks.get(foundLiveId).set(targetSocketId, {
+            micMuted: false, camOff: false,
+            micLocked: false, camLocked: false,
+          });
+        }
+        broadcastStage(foundLiveId);
+      }
+
+      // Enviar el answer al VIEWER (targetSocketId = viewerSocketId)
+      io.to(targetSocketId).emit("stage:answer", { sdp, fromSocketId: socket.id });
     });
 
     socket.on("stage:ice", ({ targetSocketId, candidate }) => {
@@ -284,19 +325,22 @@ export const setupLiveSocket = (io) => {
       if (!isAuthorized(liveId, socket.id)) return;
       stageRegistry.get(liveId)?.delete(targetSocketId);
       stageLocks.get(liveId)?.delete(targetSocketId);
+      stagePendingAnswers.get(liveId)?.delete(targetSocketId);
       broadcastStage(liveId);
       io.to(targetSocketId).emit("stage:removed");
     });
 
+    // ── DESTACAR participante en el escenario ──────────────────────────────
+    socket.on("stage:spotlight", ({ liveId, targetSocketId }) => {
+      if (!liveId) return;
+      if (!isAuthorized(liveId, socket.id)) return;
+      // Broadcast a todos en el live
+      io.to(`live_${liveId}`).emit("stage:spotlight", {
+        socketId: targetSocketId, // null = quitar spotlight
+      });
+    });
+
     // ── ADMIN MIC/CAM con lock ─────────────────────────────────────────────
-    /**
-     * stage:adminMuteMic
-     * { liveId, targetSocketId, mute: bool, lock: bool }
-     *
-     * El servidor guarda el estado y lo reenvía al viewer.
-     * El viewer apaga su propio track (track.enabled = false).
-     * Si lock=true el viewer no puede reactivarlo desde su UI.
-     */
     socket.on("stage:adminMuteMic", ({ liveId, targetSocketId, mute, lock }) => {
       if (!liveId || !targetSocketId) return;
       if (!isAuthorized(liveId, socket.id)) return;
@@ -306,9 +350,7 @@ export const setupLiveSocket = (io) => {
       const cur   = locks.get(targetSocketId) ?? {};
       locks.set(targetSocketId, { ...cur, micMuted: !!mute, micLocked: !!lock });
 
-      // Notificar al VIEWER para que apague su track
       io.to(targetSocketId).emit("stage:adminMuteMic", { mute: !!mute, lock: !!lock });
-
       broadcastStage(liveId);
     });
 
@@ -322,23 +364,19 @@ export const setupLiveSocket = (io) => {
       locks.set(targetSocketId, { ...cur, camOff: !!off, camLocked: !!lock });
 
       io.to(targetSocketId).emit("stage:adminMuteCam", { off: !!off, lock: !!lock });
-
       broadcastStage(liveId);
     });
 
-    /**
-     * El viewer reporta su estado actual de mic/cam al servidor
-     * para que el stageUpdate refleje la realidad.
-     * { liveId, micOn, camOn }
-     */
     socket.on("stage:selfState", ({ liveId, micOn, camOn }) => {
       if (!liveId) return;
       if (!stageLocks.has(liveId)) return;
       const locks = stageLocks.get(liveId);
       const cur   = locks.get(socket.id) ?? {};
-      // Solo actualizar muted/off, no los locks (esos los controla el owner)
-      if (!cur.micLocked) locks.set(socket.id, { ...cur, micMuted: !micOn });
-      if (!cur.camLocked) locks.set(socket.id, { ...cur, camOff:  !camOn });
+      // Solo actualizar muted/off si no está bloqueado
+      const updated = { ...cur };
+      if (!cur.micLocked) updated.micMuted = !micOn;
+      if (!cur.camLocked) updated.camOff   = !camOn;
+      locks.set(socket.id, updated);
       broadcastStage(liveId);
     });
 
@@ -353,6 +391,7 @@ export const setupLiveSocket = (io) => {
       stageRegistry.delete(liveId);
       stageLocks.delete(liveId);
       stageAdmins.delete(liveId);
+      stagePendingAnswers.delete(liveId);
     });
 
     // ── LIVE: LEAVE ────────────────────────────────────────────────────────
@@ -362,6 +401,7 @@ export const setupLiveSocket = (io) => {
       viewerRegistry.get(liveId)?.delete(socket.id);
       stageLocks.get(liveId)?.delete(socket.id);
       stageAdmins.get(liveId)?.delete(socket.id);
+      stagePendingAnswers.get(liveId)?.delete(socket.id);
       iceCandidateQueues.delete(socket.id);
       socket.leave(`live_${liveId}`);
 
@@ -390,6 +430,7 @@ export const setupLiveSocket = (io) => {
           stageRegistry.delete(liveId);
           stageLocks.delete(liveId);
           stageAdmins.delete(liveId);
+          stagePendingAnswers.delete(liveId);
           break;
         }
       }
@@ -407,6 +448,7 @@ export const setupLiveSocket = (io) => {
         if (reg.has(socket.id)) {
           reg.delete(socket.id);
           stageLocks.get(liveId)?.delete(socket.id);
+          stagePendingAnswers.get(liveId)?.delete(socket.id);
           broadcastStage(liveId);
         }
       }
